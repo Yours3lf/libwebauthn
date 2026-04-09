@@ -1,0 +1,3 @@
+[submodule "libwebutil"]
+	path = libwebutil
+	url = https://github.com/Yours3lf/libwebutil.git
