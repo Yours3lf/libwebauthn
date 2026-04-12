@@ -6,6 +6,9 @@
 //Mostly built based on 
 //https://github.com/duo-labs/py_webauthn/
 
+//TODO just deal with CBOR directly as opposed to CBOR->JSON conversion
+//TODO optimise code by removing the many many copies
+
 //TODO change to RapidJSON once the implementation is solid
 //https://github.com/nlohmann/json
 #include "nlohmann/json.hpp"
@@ -31,14 +34,28 @@ using json=nlohmann::json;
 namespace libwebauthn
 {
 
-enum PubKeyType : int32_t
+enum class COSEKey : int32_t
+{
+    KTY = 1,
+    ALG = 3,
+    // EC2, OKP
+    CRV = -1,
+    X = -2,
+    // EC2
+    Y = -3,
+    // RSA
+    N = -1,
+    E = -2
+};
+
+enum class PubKeyType : int32_t
 {
     OKP = 1,
     EC2 = 2,
     RSA = 3
 };
 
-enum PubKeyAlg : int32_t
+enum class PubKeyAlg : int32_t
 {
     ECDSA_SHA_256 = -7,
     EDDSA = -8,
@@ -52,7 +69,7 @@ enum PubKeyAlg : int32_t
     RSASSA_PKCS1_v1_5_SHA_1 = -65535
 };
 
-enum PubKeyCrv : int32_t
+enum class PubKeyCrv : int32_t
 {
     P256 = 1,       //EC2, NIST P-256 also known as secp256r1
     P384 = 2,       //EC2, NIST P-384 also known as secp384r1
@@ -61,8 +78,8 @@ enum PubKeyCrv : int32_t
 };
 
 const std::vector<PubKeyAlg> defaultSupportedPubKeyAlgos = {
-    ECDSA_SHA_256, 
-    RSASSA_PKCS1_v1_5_SHA_256
+    PubKeyAlg::ECDSA_SHA_256, 
+    PubKeyAlg::RSASSA_PKCS1_v1_5_SHA_256
 };
 
 struct DecodedPublicKey
@@ -71,24 +88,159 @@ struct DecodedPublicKey
     PubKeyAlg alg; 
 };
 
+int PublicKeyCrvToOpenSSLNid(PubKeyCrv crv)
+{
+    switch(crv)
+    {
+        case PubKeyCrv::P256: return NID_X9_62_prime256v1;
+        case PubKeyCrv::P384: return NID_secp384r1;
+        case PubKeyCrv::P521: return NID_secp521r1;
+        //case ED25519: return 0; //this EDDSA, not ECDSA so this is different
+        default: assert(0);
+    }
+}
+
 struct DecodedPublicKeyOKP : public DecodedPublicKey
 {
-    PubKeyCrv crv;
-    std::vector<uint8_t> x;
+    struct {
+        EVP_PKEY* pkey = nullptr;
+    } crypto;
+
+    void build(
+        PubKeyCrv crv,
+        const std::vector<uint8_t>& x
+    )
+    {
+        EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(
+            (int)crv, //EVP_PKEY_ED25519,
+            NULL,
+            x.data(),
+            x.size()
+        );
+
+        crypto.pkey = pkey;
+    }
+
+    void destroy()
+    {
+        EVP_PKEY_free(crypto.pkey);
+    }
 };
 
 struct DecodedPublicKeyEC2 : public DecodedPublicKey
 {
-    PubKeyCrv crv;
-    std::vector<uint8_t> x;
-    std::vector<uint8_t> y;
+    struct {
+    EC_KEY* ec_key = nullptr;
+    BIGNUM* bn_x = nullptr;
+    BIGNUM* bn_y = nullptr;
+    EC_POINT* point = nullptr;
+    EVP_PKEY* pkey = nullptr;
+    } crypto;
+
+    void build(
+        PubKeyCrv crv,
+        const std::vector<uint8_t>& x,
+        const std::vector<uint8_t>& y
+    )
+    {
+        EC_KEY* ec_key = EC_KEY_new_by_curve_name(PublicKeyCrvToOpenSSLNid(crv));
+
+        BIGNUM* bn_x = BN_bin2bn(x.data(), x.size(), nullptr);
+        BIGNUM* bn_y = BN_bin2bn(y.data(), y.size(), nullptr);
+
+        EC_POINT* point = EC_POINT_new(EC_KEY_get0_group(ec_key));
+        EC_POINT_set_affine_coordinates_GFp(
+            EC_KEY_get0_group(ec_key),
+            point,
+            bn_x,
+            bn_y,
+            nullptr
+        );
+
+        EC_KEY_set_public_key(ec_key, point);
+
+        EVP_PKEY* pkey = EVP_PKEY_new();
+        EVP_PKEY_assign_EC_KEY(pkey, ec_key);
+
+        crypto.ec_key = ec_key;
+        crypto.bn_x = bn_x;
+        crypto.bn_y = bn_y;
+        crypto.point = point;
+        crypto.pkey = pkey;
+    }
+
+    void destroy()
+    {
+        EVP_PKEY_free(crypto.pkey);
+        EC_POINT_free(crypto.point);
+        BN_free(crypto.bn_x);
+        BN_free(crypto.bn_y);
+    }
 };
 
 struct DecodedPublicKeyRSA : public DecodedPublicKey
 {
-    std::vector<uint8_t> n;
-    std::vector<uint8_t> e;
+    struct {
+        BIGNUM* n_bn = nullptr;
+        BIGNUM* e_bn = nullptr;
+        RSA* rsa = nullptr;
+        EVP_PKEY* pkey = nullptr;
+    } crypto;
+
+    void build(
+        std::vector<uint8_t> n,
+        std::vector<uint8_t> e
+    )
+    {
+        BIGNUM* n_bn = BN_bin2bn(n.data(), n.size(), nullptr);
+        BIGNUM* e_bn = BN_bin2bn(e.data(), e.size(), nullptr);
+
+        RSA* rsa = RSA_new();
+        RSA_set0_key(rsa, n_bn, e_bn, nullptr);
+
+        EVP_PKEY* pkey = EVP_PKEY_new();
+        EVP_PKEY_assign_RSA(pkey, rsa);
+
+        crypto.n_bn = n_bn;
+        crypto.e_bn = e_bn;
+        crypto.rsa = rsa;
+        crypto.pkey = pkey;
+    }
+
+    void destroy()
+    {
+        EVP_PKEY_free(crypto.pkey);
+        RSA_free(crypto.rsa);
+        BN_free(crypto.n_bn);
+        BN_free(crypto.e_bn);
+    }
 };
+
+void destroyPubKey(DecodedPublicKey* pubKey)
+{
+    assert(pubKey);
+
+    switch(pubKey->kty)
+    {
+        case PubKeyType::OKP: 
+        {
+            reinterpret_cast<DecodedPublicKeyOKP*>(pubKey)->destroy();
+            break;
+        }
+        case PubKeyType::EC2:
+        {
+            reinterpret_cast<DecodedPublicKeyEC2*>(pubKey)->destroy();
+            break;
+        }
+        case PubKeyType::RSA:
+        {
+            reinterpret_cast<DecodedPublicKeyRSA*>(pubKey)->destroy();
+            break;
+        }
+    }
+
+    delete pubKey;
+}
 
 /**
     Attributes:
@@ -335,6 +487,11 @@ size_t getCBORByteSize(const std::string& CBORStr)
     return getCBORByteSize(CBORStr.data(), CBORStr.size());
 }
 
+int64_t cborGetInt64(cbor_item_t* i)
+{
+    return -(int64_t)cbor_get_int(i) - 1;
+}
+
 json traverseCBOR(cbor_item_t* decoded)
 {
     json j;
@@ -349,10 +506,29 @@ json traverseCBOR(cbor_item_t* decoded)
             cbor_item_t* key = handle[i].key;
             cbor_item_t* value = handle[i].value;
 
-            if (!cbor_isa_string(key))
+            if (
+                !(cbor_isa_string(key) ||
+                  cbor_isa_uint(key)   ||
+                  cbor_isa_negint(key))
+            )
+            {
                 continue;
+            }
 
-            std::string keyStr((char *)cbor_string_handle(key), cbor_string_length(key));
+            std::string keyStr;
+
+            if(cbor_isa_string(key))
+            {
+                keyStr = std::string((char *)cbor_string_handle(key), cbor_string_length(key));
+            }
+            else if(cbor_isa_uint(key))
+            {
+                keyStr = std::to_string(cbor_get_int(key));
+            }
+            else if(cbor_isa_negint(key))
+            {
+                keyStr = std::to_string(cborGetInt64(key));
+            }
 
             if(cbor_isa_string(value))
             {
@@ -372,8 +548,7 @@ json traverseCBOR(cbor_item_t* decoded)
             }
             else if(cbor_isa_negint(value))
             {
-                int64_t v = cbor_get_int(value);
-                j[keyStr] = v; 
+                j[keyStr] = cborGetInt64(value);
             }
             else if(cbor_isa_array(value) || cbor_isa_map(value))
             {
@@ -392,27 +567,26 @@ json traverseCBOR(cbor_item_t* decoded)
             if(cbor_isa_string(value))
             {
                 std::string valStr((char *)cbor_string_handle(value), cbor_string_length(value));
-                j[i] = valStr;
+                j.push_back(valStr);
             }
             else if(cbor_isa_bytestring(value))
             {
                 size_t len = cbor_bytestring_length(value);
                 uint8_t* data = cbor_bytestring_handle(value);
                 std::vector<uint8_t> dataVec(data, data + len);
-                j[i] = dataVec;
+                j.push_back(dataVec);
             }
             else if(cbor_isa_uint(value))
             {
-                j[i] = cbor_get_int(value);
+                j.push_back(cbor_get_int(value));
             }
             else if(cbor_isa_negint(value))
             {
-                int64_t v = cbor_get_int(value);
-                j[i] = v; 
+                j.push_back(cborGetInt64(value));
             }
             else if(cbor_isa_array(value) || cbor_isa_map(value))
             {
-                j[i] = traverseCBOR(value);
+                j.push_back(traverseCBOR(value));
             }
         }
     }
@@ -442,41 +616,22 @@ json convertCBORtoJSON(const std::string& CBORStr)
 }
 
 bool verifySignature(
-    const json& j,
+    const DecodedPublicKey* decodedCredentialPublicKey,
     const std::string& signature,
     const std::string& signedData
 )
 {
-    int32_t alg = j["alg"];
-    if(alg == -7)
+    assert(decodedCredentialPublicKey);
+
+    PubKeyAlg alg = decodedCredentialPublicKey->alg;
+    if(alg == PubKeyAlg::ECDSA_SHA_256)
     {
-        //Algo ES256, must use crv P-256
-
-        //build Elliptic Curve
-        std::vector<uint8_t> x, y;
-        EC_KEY* ec_key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-
-        BIGNUM* bn_x = BN_bin2bn(x.data(), x.size(), nullptr);
-        BIGNUM* bn_y = BN_bin2bn(y.data(), y.size(), nullptr);
-
-        EC_POINT* point = EC_POINT_new(EC_KEY_get0_group(ec_key));
-        EC_POINT_set_affine_coordinates_GFp(
-            EC_KEY_get0_group(ec_key),
-            point,
-            bn_x,
-            bn_y,
-            nullptr
-        );
-
-        EC_KEY_set_public_key(ec_key, point);
-
-        EVP_PKEY* pkey = EVP_PKEY_new();
-        EVP_PKEY_assign_EC_KEY(pkey, ec_key);
+        DecodedPublicKeyEC2* pubkey = (DecodedPublicKeyEC2*)decodedCredentialPublicKey;
 
         //verify signature
         EVP_MD_CTX* ctx = EVP_MD_CTX_new();
 
-        EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr, pkey);
+        EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr, pubkey->crypto.pkey);
 
         int ret = EVP_DigestVerify(
             ctx,
@@ -506,23 +661,14 @@ bool verifySignature(
             return false;
         }
     }
-    else if(alg == -257)
+    else if(alg == PubKeyAlg::RSASSA_PKCS1_v1_5_SHA_256)
     {
-        //build modulus, exponent
-        std::vector<uint8_t> n, e;
-        BIGNUM* n_bn = BN_bin2bn(n.data(), n.size(), nullptr);
-        BIGNUM* e_bn = BN_bin2bn(e.data(), e.size(), nullptr);
-
-        ::RSA* rsa = RSA_new();
-        RSA_set0_key(rsa, n_bn, e_bn, nullptr);
-
-        EVP_PKEY* pkey = EVP_PKEY_new();
-        EVP_PKEY_assign_RSA(pkey, rsa);
+        DecodedPublicKeyRSA* pubkey = (DecodedPublicKeyRSA*)decodedCredentialPublicKey;
 
         //verify signature
         EVP_MD_CTX* ctx = EVP_MD_CTX_new();
 
-        EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr, pkey);
+        EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr, pubkey->crypto.pkey);
 
         // Important: explicitly set padding for RSA
         EVP_PKEY_CTX* pctx = EVP_MD_CTX_pkey_ctx(ctx);
@@ -556,7 +702,7 @@ bool verifySignature(
     }
     else
     {
-        std::cerr << "unsupported public key algo " << alg << std::endl;
+        std::cerr << "unsupported public key algo " << (int32_t)alg << std::endl;
         return false;
     }
 }
@@ -647,10 +793,9 @@ AuthenticatorData parseAuthenticatorData(const std::vector<uint8_t>& authData)
     return ad;
 }
 
-//https://github.com/duo-labs/py_webauthn/blob/master/webauthn/helpers/decode_credential_public_key.py#L36
 bool decodeCredentialPublicKey(
     const std::vector<uint8_t>& key, //in cbor
-    std::unique_ptr<DecodedPublicKey>* decodedKey
+    DecodedPublicKey** decodedKey //caller needs to destroy/free this
 )
 {
     assert(decodedKey);
@@ -658,56 +803,54 @@ bool decodeCredentialPublicKey(
     if(key[0] == 0x04)
     {
         //special case for older Fido devices
-        std::unique_ptr<DecodedPublicKeyEC2> ec2(new DecodedPublicKeyEC2());
-        ec2->kty = EC2;
-        ec2->alg = ECDSA_SHA_256;
-        ec2->crv = P256;
-        ec2->x = std::vector<uint8_t>(key.begin()+1, key.begin()+33);
-        ec2->y = std::vector<uint8_t>(key.begin()+33, key.begin()+65);
-        *decodedKey = std::move(ec2);
+        DecodedPublicKeyEC2* keyPtr = new DecodedPublicKeyEC2();
+        keyPtr->kty = PubKeyType::EC2;
+        keyPtr->alg = PubKeyAlg::ECDSA_SHA_256;
+        keyPtr->build(
+            PubKeyCrv::P256,
+            std::vector<uint8_t>(key.begin()+1, key.begin()+33),
+            std::vector<uint8_t>(key.begin()+33, key.begin()+65)
+        );
+        *decodedKey = keyPtr;
         return true;
     }
 
     json keyJSON = convertCBORtoJSON((const char*)key.data(), key.size());
     std::cout << keyJSON.dump(2) << std:: endl;
 
-    PubKeyType kty = (PubKeyType)keyJSON[1];
-    PubKeyAlg alg = (PubKeyAlg)keyJSON[3];
+    PubKeyType kty = (PubKeyType)keyJSON[std::to_string((int32_t)COSEKey::KTY)];
+    PubKeyAlg alg = (PubKeyAlg)keyJSON[std::to_string((int32_t)COSEKey::ALG)];
 
-    if(kty == OKP)
+    if(kty == PubKeyType::OKP)
     {
-        int32_t crv = keyJSON[-1];
-        std::vector<uint8_t> x = keyJSON[-2];
-        std::unique_ptr<DecodedPublicKeyOKP> okp(new DecodedPublicKeyOKP());
-        okp->kty = kty;
-        okp->alg = alg;
-        okp->crv = (PubKeyCrv)crv;
-        okp->x = x;
-        *decodedKey = std::move(okp);
+        int32_t crv = keyJSON[std::to_string((int32_t)COSEKey::CRV)];
+        std::vector<uint8_t> x = keyJSON[std::to_string((int32_t)COSEKey::X)];
+        DecodedPublicKeyOKP* keyPtr = new DecodedPublicKeyOKP();
+        keyPtr->kty = kty;
+        keyPtr->alg = alg;
+        keyPtr->build((PubKeyCrv)crv, x);
+        *decodedKey = keyPtr;
     }
-    else if(kty == EC2)
+    else if(kty == PubKeyType::EC2)
     {
-        int32_t crv = keyJSON[-1];
-        std::vector<uint8_t> x = keyJSON[-2];
-        std::vector<uint8_t> y = keyJSON[-3];
-        std::unique_ptr<DecodedPublicKeyEC2> ec2(new DecodedPublicKeyEC2());
-        ec2->kty = kty;
-        ec2->alg = alg;
-        ec2->crv = (PubKeyCrv)crv;
-        ec2->x = x;
-        ec2->y = y;
-        *decodedKey = std::move(ec2);
+        int32_t crv = keyJSON[std::to_string((int32_t)COSEKey::CRV)];
+        std::vector<uint8_t> x = keyJSON[std::to_string((int32_t)COSEKey::X)];
+        std::vector<uint8_t> y = keyJSON[std::to_string((int32_t)COSEKey::Y)];
+        DecodedPublicKeyEC2* keyPtr = new DecodedPublicKeyEC2();
+        keyPtr->kty = kty;
+        keyPtr->alg = alg;
+        keyPtr->build((PubKeyCrv)crv, x, y);
+        *decodedKey = keyPtr;
     }
-    else if(kty == RSA)
+    else if(kty == PubKeyType::RSA)
     {
-        std::vector<uint8_t> n = keyJSON[-1];
-        std::vector<uint8_t> e = keyJSON[-2];
-        std::unique_ptr<DecodedPublicKeyRSA> rsa(new DecodedPublicKeyRSA());
-        rsa->kty = kty;
-        rsa->alg = alg;
-        rsa->n = n;
-        rsa->e = e;
-        *decodedKey = std::move(rsa);
+        std::vector<uint8_t> n = keyJSON[std::to_string((int32_t)COSEKey::N)];
+        std::vector<uint8_t> e = keyJSON[std::to_string((int32_t)COSEKey::E)];
+        DecodedPublicKeyRSA* keyPtr = new DecodedPublicKeyRSA();
+        keyPtr->kty = kty;
+        keyPtr->alg = alg;
+        keyPtr->build(n, e);
+        *decodedKey = keyPtr;
     }
 
     return true;
@@ -932,12 +1075,16 @@ bool verifySignupResponse(
         //https://github.com/duo-labs/py_webauthn/blob/master/webauthn/helpers/decode_credential_public_key.py#L36
     }
     
-    std::unique_ptr<DecodedPublicKey> credentialPublicKey;
-    decodeCredentialPublicKey(attestationObject.authenticatorData.attestedCredData.credentialPublicKey, &credentialPublicKey);
-    
+    DecodedPublicKey* credentialPublicKey = nullptr;
+    if(!decodeCredentialPublicKey(attestationObject.authenticatorData.attestedCredData.credentialPublicKey, &credentialPublicKey))
+    {
+        std::cerr << "failed to decode credential public key" << std::endl;
+        return false;
+    }
+
     if(std::find(supportedPubKeyAlgos.begin(), supportedPubKeyAlgos.end(), credentialPublicKey->alg) == supportedPubKeyAlgos.end())
     {
-        std::cerr << "pub key alg: " << credentialPublicKey->alg << " not supported" << std::endl;
+        std::cerr << "pub key alg: " << (int32_t)credentialPublicKey->alg << " not supported" << std::endl;
         return false;
     }
 
@@ -1025,6 +1172,8 @@ bool verifySignupResponse(
         isMultiDevice,
         isBackedUp
     };
+
+    destroyPubKey(credentialPublicKey);
 
     return true;
 }
@@ -1173,11 +1322,16 @@ bool verifyLoginResponse(
 
     std::string signatureBase64Str = j["response"]["signature"];
 
-    json decodedPublicKey = convertCBORtoJSON(std::string(credentialPublicKey.begin(), credentialPublicKey.end()));
-    std::cout << decodedPublicKey.dump(2) << std::endl;
+    DecodedPublicKey* decodedCredentialPublicKey = nullptr;
+    if(!decodeCredentialPublicKey(credentialPublicKey, &decodedCredentialPublicKey))
+    {
+        std::cerr << "failed to decode credential public key" << std::endl;
+        return false;
+    }
 
+    //TODO this fails...
     bool verified = verifySignature(
-        decodedPublicKey,
+        decodedCredentialPublicKey,
         decodeBase64Url(signatureBase64Str),
         signedData
     );
@@ -1206,6 +1360,8 @@ bool verifyLoginResponse(
         isBackedUp,
         authenticatorData.flags.uv()
     };
+
+    destroyPubKey(decodedCredentialPublicKey);
 
     return true;
 }
