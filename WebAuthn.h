@@ -618,12 +618,16 @@ json convertCBORtoJSON(const std::string& CBORStr)
 bool verifySignature(
     const DecodedPublicKey* decodedCredentialPublicKey,
     const std::string& signature,
-    const std::string& signedData
+    const std::vector<uint8_t>& signedData
 )
 {
     assert(decodedCredentialPublicKey);
 
     PubKeyAlg alg = decodedCredentialPublicKey->alg;
+
+    std::cout << "Login verification: " << std::endl;
+    std::cout << "Algo: " << (int32_t)alg << std::endl;
+
     if(alg == PubKeyAlg::ECDSA_SHA_256)
     {
         DecodedPublicKeyEC2* pubkey = (DecodedPublicKeyEC2*)decodedCredentialPublicKey;
@@ -1318,9 +1322,20 @@ bool verifyLoginResponse(
 
     auto clientDataHash = sha256(clientDataJSONStr);
 
-    std::string signedData = authenticatorDataStr + bytesToString(clientDataHash);
+    std::vector<uint8_t> signedData;
+    signedData.insert(signedData.end(), authenticatorDataStr.begin(), authenticatorDataStr.end());
+    signedData.insert(signedData.end(), clientDataHash.begin(), clientDataHash.end());
+
+    std::cout << "AuthenticatorDataStr: " << authenticatorDataStr << std::endl;
+    std::cout << "clientDataJSONStr: " << clientDataJSONStr << std::endl;
+    std::cout << "clientDataHashStr: " << bytesToString(clientDataHash) << std::endl;
+    std::cout << "signedData: " << bytesToString(signedData) << std::endl;
+
 
     std::string signatureBase64Str = j["response"]["signature"];
+    std::string signature = decodeBase64Url(signatureBase64Str);
+
+    std::cout << "Signature: " << signature << std::endl;
 
     DecodedPublicKey* decodedCredentialPublicKey = nullptr;
     if(!decodeCredentialPublicKey(credentialPublicKey, &decodedCredentialPublicKey))
@@ -1332,7 +1347,7 @@ bool verifyLoginResponse(
     //TODO this fails...
     bool verified = verifySignature(
         decodedCredentialPublicKey,
-        decodeBase64Url(signatureBase64Str),
+        signature,
         signedData
     );
 
