@@ -9,6 +9,8 @@
 //TODO just deal with CBOR directly as opposed to CBOR->JSON conversion
 //TODO optimise code by removing the many many copies
 
+//TODO test: https://github.com/duo-labs/py_webauthn/tree/master/tests
+
 //TODO change to RapidJSON once the implementation is solid
 //https://github.com/nlohmann/json
 #include "nlohmann/json.hpp"
@@ -34,6 +36,176 @@ using json=nlohmann::json;
 namespace libwebauthn
 {
 
+/**
+    Attributes:
+    `credential_id`: The generated credential's ID
+    `credential_public_key`: The generated credential's public key
+    `sign_count`: How many times the authenticator says the credential was used
+    `aaguid`: A 128-bit identifier indicating the type and vendor of the authenticator
+    `fmt`: The attestation format
+    `credential_type`: The literal string "public-key"
+    `user_verified`: Whether the user was verified by the authenticator
+    `attestation_object`: The raw attestation object for later scrutiny
+/**/
+struct VerifiedRegistration
+{
+    std::vector<uint8_t> credentialId;
+    std::vector<uint8_t> credentialPublicKey;
+    uint32_t signCount = 0;
+    std::string aaguid;
+    std::string fmt;
+    std::string credType;
+    bool userVerified;
+    std::string attestationObjectBase64Str;
+    bool isMultiDevice;
+    bool isBackedUp;
+
+    json toJSON()
+    {
+        json j;
+        
+        for(int c = 0; c < credentialId.size(); ++c)
+        {
+            j["credentialId"][c] = credentialId[c];
+        }
+
+        for(int c = 0; c < credentialPublicKey.size(); ++c)
+        {
+            j["credentialPublicKey"][c] = credentialPublicKey[c];
+        }
+
+        j["signCount"] = signCount;
+        j["aaguid"] = aaguid;
+        j["fmt"] = fmt;
+        j["credType"] = credType;
+        j["userVerified"] = userVerified;
+        j["attestationObjectBase64Str"] = attestationObjectBase64Str;
+        j["isMultiDevice"] = isMultiDevice;
+        j["isBackedUp"] = isBackedUp;
+
+        return j;
+    }
+
+    static VerifiedRegistration fromJSON(const json& j)
+    {
+        VerifiedRegistration vr;
+        for(int c = 0; c < j["credentialId"].size(); ++c)
+        {
+            vr.credentialId.push_back(j["credentialId"][c]);
+        }
+        for(int c = 0; c < j["credentialPublicKey"].size(); ++c)
+        {
+            vr.credentialPublicKey.push_back(j["credentialPublicKey"][c]);
+        }
+        vr.signCount = j["signCount"];
+        vr.aaguid = j["aaguid"];
+        vr.fmt = j["fmt"];
+        vr.credType = j["credType"];
+        vr.userVerified = j["userVerified"];
+        vr.attestationObjectBase64Str = j["attestationObjectBase64Str"];
+        vr.isMultiDevice = j["isMultiDevice"];
+        vr.isBackedUp = j["isBackedUp"];
+
+        return vr;
+    }
+};
+
+struct VerifiedAuthentication
+{
+    std::vector<uint8_t> credentialId;
+    uint32_t newSignCount;
+    bool isMultiDevice;
+    bool isBackedUp;
+    bool userVerified;
+};
+
+/**
+    Attributes:
+    `type`: The literal string `"public-key"`
+    `id`: The sequence of bytes representing the credential's ID
+    (optional) `transports`: The types of connections to the client/browser the authenticator supports
+/**/
+struct PublicKeyCredentialDescriptor
+{
+    std::vector<uint8_t> id;
+    std::string type = "public-key";
+    std::vector<std::string> transports;
+};
+
+struct AuthenticatorSelectionCriteria
+{
+    std::string attachment; //platform, cross-platform
+    std::string residentKey; //discouraged, preferred, required
+    bool requireResidentKey = false;
+    std::string userVerification = "preferred"; //discouraged, preferred, required
+};
+
+enum class PubKeyAlg : int32_t
+{
+    ECDSA_SHA_256 = -7,
+    EDDSA = -8,
+    ECDSA_SHA_512 = -36,
+    RSASSA_PSS_SHA_256 = -37,
+    RSASSA_PSS_SHA_384 = -38,
+    RSASSA_PSS_SHA_512 = -39,
+    RSASSA_PKCS1_v1_5_SHA_256 = -257,
+    RSASSA_PKCS1_v1_5_SHA_384 = -258,
+    RSASSA_PKCS1_v1_5_SHA_512 = -259,
+    RSASSA_PKCS1_v1_5_SHA_1 = -65535
+};
+
+const std::vector<PubKeyAlg> defaultSupportedPubKeyAlgos = {
+    PubKeyAlg::ECDSA_SHA_256, 
+    PubKeyAlg::RSASSA_PKCS1_v1_5_SHA_256
+};
+
+
+std::string encodeBase64Url(const char* data, size_t len)
+{
+    std::string str;
+    {
+        str.resize(len * 2);
+        size_t size = str.size();
+        base64_encode(data, len, str.data(), &size, 0);
+        str.resize(size);
+        str = urlSafeBase64(str);
+    }
+
+    return str;
+}
+
+std::string encodeBase64Url(const std::string& str)
+{
+    return encodeBase64Url(str.data(), str.size());
+}
+
+std::string decodeBase64Url(const char* data, uint32_t len)
+{
+    std::string normalisedStr;
+    normalisedStr.resize(len);
+    std::copy(data, data + len, normalisedStr.data());
+    normalisedStr = normalizeBase64(normalisedStr);
+    
+    std::string str;
+    {
+        str.resize(len);
+        size_t size = str.size();
+        int res = base64_decode(normalisedStr.data(), normalisedStr.size(), str.data(), &size, 0);
+        assert(res == 1);
+        str.resize(size);
+    }
+
+    return str;
+}
+
+std::string decodeBase64Url(const std::string& str)
+{
+    return decodeBase64Url(str.data(), str.size());
+}
+
+namespace internal
+{
+
 enum class COSEKey : int32_t
 {
     KTY = 1,
@@ -55,31 +227,12 @@ enum class PubKeyType : int32_t
     RSA = 3
 };
 
-enum class PubKeyAlg : int32_t
-{
-    ECDSA_SHA_256 = -7,
-    EDDSA = -8,
-    ECDSA_SHA_512 = -36,
-    RSASSA_PSS_SHA_256 = -37,
-    RSASSA_PSS_SHA_384 = -38,
-    RSASSA_PSS_SHA_512 = -39,
-    RSASSA_PKCS1_v1_5_SHA_256 = -257,
-    RSASSA_PKCS1_v1_5_SHA_384 = -258,
-    RSASSA_PKCS1_v1_5_SHA_512 = -259,
-    RSASSA_PKCS1_v1_5_SHA_1 = -65535
-};
-
 enum class PubKeyCrv : int32_t
 {
     P256 = 1,       //EC2, NIST P-256 also known as secp256r1
     P384 = 2,       //EC2, NIST P-384 also known as secp384r1
     P521 = 3,       //EC2, NIST P-521 also known as secp521r1
     ED25519 = 6     //OKP, Ed25519 for use w/ EdDSA only
-};
-
-const std::vector<PubKeyAlg> defaultSupportedPubKeyAlgos = {
-    PubKeyAlg::ECDSA_SHA_256, 
-    PubKeyAlg::RSASSA_PKCS1_v1_5_SHA_256
 };
 
 struct DecodedPublicKey
@@ -311,61 +464,6 @@ struct AttestationObject
     json attStmt;
 };
 
-/**
-    Attributes:
-    `credential_id`: The generated credential's ID
-    `credential_public_key`: The generated credential's public key
-    `sign_count`: How many times the authenticator says the credential was used
-    `aaguid`: A 128-bit identifier indicating the type and vendor of the authenticator
-    `fmt`: The attestation format
-    `credential_type`: The literal string "public-key"
-    `user_verified`: Whether the user was verified by the authenticator
-    `attestation_object`: The raw attestation object for later scrutiny
-/**/
-struct VerifiedRegistration
-{
-    std::vector<uint8_t> credentialId;
-    std::vector<uint8_t> credentialPublicKey;
-    uint32_t signCount = 0;
-    std::string aaguid;
-    std::string fmt;
-    std::string credType;
-    bool userVerified;
-    std::string attestationObjectBase64Str;
-    bool isMultiDevice;
-    bool isBackedUp;
-};
-
-struct VerifiedAuthentication
-{
-    std::vector<uint8_t> credentialId;
-    uint32_t newSignCount;
-    bool isMultiDevice;
-    bool isBackedUp;
-    bool userVerified;
-};
-
-struct AuthenticatorSelectionCriteria
-{
-    std::string attachment; //platform, cross-platform
-    std::string residentKey; //discouraged, preferred, required
-    bool requireResidentKey = false;
-    std::string userVerification = "preferred"; //discouraged, preferred, required
-};
-
-/**
-    Attributes:
-    `type`: The literal string `"public-key"`
-    `id`: The sequence of bytes representing the credential's ID
-    (optional) `transports`: The types of connections to the client/browser the authenticator supports
-/**/
-struct PublicKeyCredentialDescriptor
-{
-    std::vector<uint8_t> id;
-    std::string type = "public-key";
-    std::vector<std::string> transports;
-};
-
 std::string aaguidToString(const std::array<uint8_t, 16>& aaguid)
 {
     std::string res = bytesToString(aaguid);
@@ -423,49 +521,6 @@ std::array<uint8_t, SHA256_DIGEST_LENGTH> sha256(const std::string& str)
     SHA256_Update(&sha256, str.c_str(), str.size());
     SHA256_Final(hash.data(), &sha256);
     return hash;
-}
-
-std::string encodeBase64Url(const char* data, size_t len)
-{
-    std::string str;
-    {
-        str.resize(len * 2);
-        size_t size = str.size();
-        base64_encode(data, len, str.data(), &size, 0);
-        str.resize(size);
-        str = urlSafeBase64(str);
-    }
-
-    return str;
-}
-
-std::string encodeBase64Url(const std::string& str)
-{
-    return encodeBase64Url(str.data(), str.size());
-}
-
-std::string decodeBase64Url(const char* data, uint32_t len)
-{
-    std::string normalisedStr;
-    normalisedStr.resize(len);
-    std::copy(data, data + len, normalisedStr.data());
-    normalisedStr = normalizeBase64(normalisedStr);
-    
-    std::string str;
-    {
-        str.resize(len);
-        size_t size = str.size();
-        int res = base64_decode(normalisedStr.data(), normalisedStr.size(), str.data(), &size, 0);
-        assert(res == 1);
-        str.resize(size);
-    }
-
-    return str;
-}
-
-std::string decodeBase64Url(const std::string& str)
-{
-    return decodeBase64Url(str.data(), str.size());
 }
 
 size_t getCBORByteSize(const char* data, size_t len)
@@ -628,6 +683,7 @@ bool verifySignature(
     std::cout << "Login verification: " << std::endl;
     std::cout << "Algo: " << (int32_t)alg << std::endl;
 
+    //TODO support more algos
     if(alg == PubKeyAlg::ECDSA_SHA_256)
     {
         DecodedPublicKeyEC2* pubkey = (DecodedPublicKeyEC2*)decodedCredentialPublicKey;
@@ -860,6 +916,92 @@ bool decodeCredentialPublicKey(
     return true;
 }
 
+bool verifyAttestationObject(
+    const AttestationObject& attestationObject,
+    const std::string& attestationObjectStr,
+    const std::string& clientDataJSONStr,
+    const std::string& credID,
+    const std::vector<uint8_t>& pemRootCertBytes
+)
+{
+    //TODO...
+    //https://github.com/duo-labs/py_webauthn/blob/master/webauthn/registration/verify_registration_response.py#L207
+
+    DecodedPublicKey* decodedCredentialPublicKey = nullptr;
+    std::string signature;
+    std::vector<uint8_t> signedData;
+
+    if(attestationObject.fmt == "none")
+    {
+        if(!attestationObject.attStmt.empty())
+        {
+            std::cerr << "attestation object with fmt none should not have a statement " << attestationObject.attStmt.dump(2) << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+    else if(attestationObject.fmt == "fido-u2f")
+    {
+        //security keys that implement the FIDO U2F standard use this format
+
+        if(!attestationObject.attStmt.contains("sig"))
+        {
+            std::cerr << "Missing signature for FIDO U2F" << std::endl;
+            return false;
+        }
+
+        if(!attestationObject.attStmt.contains("x5c"))
+        {
+            std::cerr << "Missing x5c for FIDO U2F" << std::endl;
+            return false;
+        }
+
+        //TODO..
+    }
+    else if(attestationObject.fmt == "packed")
+    {
+        //a generic attestation format that is commonly used by devices whose 
+        //sole function is as a WebAuthn authenticator, such as security keys
+    }
+    else if(attestationObject.fmt == "tpm")
+    {
+        //the Trusted Platform Module (TPM) is a set of specifications from 
+        //the Trusted Platform Group (TPG). This attestation format is commonly 
+        //found in desktop computers and is used by Windows Hello as its preferred 
+        //attestation format
+    }
+    else if(attestationObject.fmt == "apple")
+    {
+        //exclusively used by Apple for certain types of Apple devices
+    }
+    else if(attestationObject.fmt == "android-safetynet")
+    {
+        //prior to Android Key Attestation, the only option for Android devices 
+        //was to create Android SafetyNet attestations
+    }
+    else if(attestationObject.fmt == "android-key")
+    {
+        //one of the features added in Android O was Android Key Attestation, 
+        //which enables the Android operating system to attest to keys
+    }
+    else
+    {
+        std::cerr << "Unknown attestation object fmt: " << attestationObject.fmt << std::endl;
+        return false;
+    }
+
+    if(!verifySignature(decodedCredentialPublicKey, signature, signedData))
+    {
+        std::cerr << "couldn't verify attestation object signature" << std::endl;
+        return false;
+    }
+    
+    return true;
+}
+
+} //namespace internal
+
 bool generateSignupChallenge(
     json& j, //output 
     const std::string& rpId,
@@ -876,6 +1018,8 @@ bool generateSignupChallenge(
     const std::vector<std::string>& hints = {}
 )
 {
+    using namespace internal;
+
     if(rpId.empty())
     {
         std::cerr << "rpId cannot be empty" << std::endl;
@@ -981,6 +1125,8 @@ bool verifySignupResponse(
         const std::vector<PubKeyAlg>& supportedPubKeyAlgos = defaultSupportedPubKeyAlgos
     )
 {
+    using namespace internal;
+
     std::string rawIdBase64Str = j["rawId"];
     std::string credID = j["id"];
 
@@ -999,7 +1145,8 @@ bool verifySignupResponse(
     }
     
     std::string clientDataJSONBase64Str = j["response"]["clientDataJSON"];
-    json clientData = json::parse(decodeBase64Url(clientDataJSONBase64Str));
+    std::string clientDataJSONStr = decodeBase64Url(clientDataJSONBase64Str);
+    json clientData = json::parse(clientDataJSONStr);
     std::cout << clientData.dump(2) << std::endl;
 
     if(clientData["type"] != "webauthn.create")
@@ -1020,6 +1167,9 @@ bool verifySignupResponse(
         std::cerr << "origin: " << clientData["origin"] << " != expected: " << expectedOrigin << std::endl;
         return false;
     }
+
+    //TODO token binding check
+    //https://github.com/duo-labs/py_webauthn/blob/master/webauthn/registration/verify_registration_response.py#L147
 
     std::string attestationObjectBase64Str = j["response"]["attestationObject"];
     std::string attestationObjectStr = decodeBase64Url(attestationObjectBase64Str);
@@ -1073,12 +1223,6 @@ bool verifySignupResponse(
         return false;
     }
     
-    if(attestationObject.authenticatorData.attestedCredData.credentialPublicKey[0] == 0x04)
-    {
-        //TODO special case for older Fido devices
-        //https://github.com/duo-labs/py_webauthn/blob/master/webauthn/helpers/decode_credential_public_key.py#L36
-    }
-    
     DecodedPublicKey* credentialPublicKey = nullptr;
     if(!decodeCredentialPublicKey(attestationObject.authenticatorData.attestedCredData.credentialPublicKey, &credentialPublicKey))
     {
@@ -1092,62 +1236,18 @@ bool verifySignupResponse(
         return false;
     }
 
+    //TODO cert chain validation. Needed for the fmt's below
+    //https://github.com/duo-labs/py_webauthn/blob/master/webauthn/registration/verify_registration_response.py#L199
+    std::vector<uint8_t> pemRootCertBytes;
+
     //so far so good but let's verify the attestation object
-    bool verified = false;
-
-    if(attestationObject.fmt == "none")
-    {
-        if(!attestationObject.attStmt.empty())
-        {
-            std::cerr << "attestation object with fmt none should not have a statement " << attestationObject.attStmt.dump(2) << std::endl;
-            return false;
-        }
-
-        verified = true;
-    }
-    //TODO...
-    //https://github.com/duo-labs/py_webauthn/blob/master/webauthn/registration/verify_registration_response.py#L207
-    else if(attestationObject.fmt == "fido-u2f")
-    {
-        //security keys that implement the FIDO U2F standard use this format
-        //verified = verifyFidoU2f(........);
-    }
-    else if(attestationObject.fmt == "packed")
-    {
-        //a generic attestation format that is commonly used by devices whose 
-        //sole function is as a WebAuthn authenticator, such as security keys
-        //verified = verifyPacked(........);
-    }
-    else if(attestationObject.fmt == "tpm")
-    {
-        //the Trusted Platform Module (TPM) is a set of specifications from 
-        //the Trusted Platform Group (TPG). This attestation format is commonly 
-        //found in desktop computers and is used by Windows Hello as its preferred 
-        //attestation format
-        //verified = verifyTpm(........);
-    }
-    else if(attestationObject.fmt == "apple")
-    {
-        //exclusively used by Apple for certain types of Apple devices
-        //verified = verifyApple(........);
-    }
-    else if(attestationObject.fmt == "android-safetynet")
-    {
-        //prior to Android Key Attestation, the only option for Android devices 
-        //was to create Android SafetyNet attestations
-        //verified = verifyAndroidSafetyNet(........);
-    }
-    else if(attestationObject.fmt == "android-key")
-    {
-        //one of the features added in Android O was Android Key Attestation, 
-        //which enables the Android operating system to attest to keys
-        //verified = verifyAndroidKey(........);
-    }
-    else
-    {
-        std::cerr << "unsupported attestation format: " << attestationObject.fmt << std::endl;
-        return false;
-    }
+    bool verified = verifyAttestationObject(
+        attestationObject,
+        attestationObjectStr,
+        clientDataJSONStr,
+        credID,
+        pemRootCertBytes
+    );
 
     if(!verified)
     {
@@ -1177,6 +1277,9 @@ bool verifySignupResponse(
         isBackedUp
     };
 
+    //TODO check v
+    //https://github.com/duo-labs/py_webauthn/blob/master/tests/test_verify_registration_response.py
+
     destroyPubKey(credentialPublicKey);
 
     return true;
@@ -1191,6 +1294,8 @@ bool generateLoginChallenge(
     std::string userVerification = "preferred" //preferred, required, discouraged
 )
 {
+    using namespace internal;
+
     if(rpId.empty())
     {
         std::cerr << "rpId cannot be empty" << std::endl;
@@ -1243,6 +1348,8 @@ bool verifyLoginResponse(
     bool requireUserVerification = false
 )
 {
+    using namespace internal;
+
     std::string rawIdBase64Str = j["rawId"];
     std::string credID = j["id"];
 
@@ -1283,6 +1390,8 @@ bool verifyLoginResponse(
         return false;
     }
 
+    //TODO token binding check
+
     std::string authenticatorDataBase64Str = j["response"]["authenticatorData"];
     std::string authenticatorDataStr = decodeBase64Url(authenticatorDataBase64Str);
     AuthenticatorData authenticatorData = parseAuthenticatorData(std::vector<uint8_t>(authenticatorDataStr.begin(), authenticatorDataStr.end()));
@@ -1302,6 +1411,12 @@ bool verifyLoginResponse(
             std::cerr << b;
         }
         std::cerr << std::endl;
+        return false;
+    }
+
+    if(!authenticatorData.flags.up())
+    {
+        std::cerr << "user wasn't present during auth" << std::endl;
         return false;
     }
 
@@ -1331,7 +1446,6 @@ bool verifyLoginResponse(
     std::cout << "clientDataHashStr: " << bytesToString(clientDataHash) << std::endl;
     std::cout << "signedData: " << bytesToString(signedData) << std::endl;
 
-
     std::string signatureBase64Str = j["response"]["signature"];
     std::string signature = decodeBase64Url(signatureBase64Str);
 
@@ -1344,7 +1458,6 @@ bool verifyLoginResponse(
         return false;
     }
 
-    //TODO this fails...
     bool verified = verifySignature(
         decodedCredentialPublicKey,
         signature,
@@ -1375,6 +1488,9 @@ bool verifyLoginResponse(
         isBackedUp,
         authenticatorData.flags.uv()
     };
+
+    //TODO check v
+    //https://github.com/duo-labs/py_webauthn/blob/master/tests/test_verify_authentication_response.py
 
     destroyPubKey(decodedCredentialPublicKey);
 
