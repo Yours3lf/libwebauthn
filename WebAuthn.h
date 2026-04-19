@@ -36,6 +36,8 @@ using json=nlohmann::json;
 namespace libwebauthn
 {
 
+static bool debugPrint = false;
+
 /**
     Attributes:
     `credential_id`: The generated credential's ID
@@ -656,7 +658,10 @@ json convertCBORtoJSON(const char* data, size_t len)
     assert(result.error.code == CBOR_ERR_NONE);
     assert(cbor);
 
-    cbor_describe(cbor, stdout);
+    if(debugPrint)
+    {
+        cbor_describe(cbor, stdout);
+    }
 
     json j = traverseCBOR(cbor);
 
@@ -680,8 +685,11 @@ bool verifySignature(
 
     PubKeyAlg alg = decodedCredentialPublicKey->alg;
 
-    std::cout << "Login verification: " << std::endl;
-    std::cout << "Algo: " << (int32_t)alg << std::endl;
+    if(debugPrint)
+    {
+        std::cout << "Login verification: " << std::endl;
+        std::cout << "Algo: " << (int32_t)alg << std::endl;
+    }
 
     //TODO support more algos
     if(alg == PubKeyAlg::ECDSA_SHA_256)
@@ -876,7 +884,11 @@ bool decodeCredentialPublicKey(
     }
 
     json keyJSON = convertCBORtoJSON((const char*)key.data(), key.size());
-    std::cout << keyJSON.dump(2) << std:: endl;
+
+    if(debugPrint)
+    {
+        std::cout << keyJSON.dump(2) << std:: endl;
+    }
 
     PubKeyType kty = (PubKeyType)keyJSON[std::to_string((int32_t)COSEKey::KTY)];
     PubKeyAlg alg = (PubKeyAlg)keyJSON[std::to_string((int32_t)COSEKey::ALG)];
@@ -1147,7 +1159,11 @@ bool verifySignupResponse(
     std::string clientDataJSONBase64Str = j["response"]["clientDataJSON"];
     std::string clientDataJSONStr = decodeBase64Url(clientDataJSONBase64Str);
     json clientData = json::parse(clientDataJSONStr);
-    std::cout << clientData.dump(2) << std::endl;
+
+    if(debugPrint)
+    {
+        std::cout << clientData.dump(2) << std::endl;
+    }
 
     if(clientData["type"] != "webauthn.create")
     {
@@ -1174,7 +1190,11 @@ bool verifySignupResponse(
     std::string attestationObjectBase64Str = j["response"]["attestationObject"];
     std::string attestationObjectStr = decodeBase64Url(attestationObjectBase64Str);
     json attestationObjectJSON = convertCBORtoJSON(attestationObjectStr);
-    std::cout << attestationObjectJSON.dump(2) << std::endl;
+
+    if(debugPrint)
+    {
+        std::cout << attestationObjectJSON.dump(2) << std::endl;
+    }
 
     AttestationObject attestationObject;
     attestationObject.authenticatorData = parseAuthenticatorData(attestationObjectJSON["authData"]);
@@ -1370,7 +1390,11 @@ bool verifyLoginResponse(
     std::string clientDataJSONBase64Str = j["response"]["clientDataJSON"];
     std::string clientDataJSONStr = decodeBase64Url(clientDataJSONBase64Str);
     json clientData = json::parse(clientDataJSONStr);
-    std::cout << clientData.dump(2) << std::endl;
+
+    if(debugPrint)
+    {
+        std::cout << clientData.dump(2) << std::endl;
+    }
 
     if(clientData["type"] != "webauthn.get")
     {
@@ -1441,15 +1465,17 @@ bool verifyLoginResponse(
     signedData.insert(signedData.end(), authenticatorDataStr.begin(), authenticatorDataStr.end());
     signedData.insert(signedData.end(), clientDataHash.begin(), clientDataHash.end());
 
-    std::cout << "AuthenticatorDataStr: " << authenticatorDataStr << std::endl;
-    std::cout << "clientDataJSONStr: " << clientDataJSONStr << std::endl;
-    std::cout << "clientDataHashStr: " << bytesToString(clientDataHash) << std::endl;
-    std::cout << "signedData: " << bytesToString(signedData) << std::endl;
-
     std::string signatureBase64Str = j["response"]["signature"];
     std::string signature = decodeBase64Url(signatureBase64Str);
 
-    std::cout << "Signature: " << signature << std::endl;
+    if(debugPrint)
+    {
+        std::cout << "AuthenticatorDataStr: " << authenticatorDataStr << std::endl;
+        std::cout << "clientDataJSONStr: " << clientDataJSONStr << std::endl;
+        std::cout << "clientDataHashStr: " << bytesToString(clientDataHash) << std::endl;
+        std::cout << "signedData: " << bytesToString(signedData) << std::endl;
+        std::cout << "Signature: " << signature << std::endl;
+    }
 
     DecodedPublicKey* decodedCredentialPublicKey = nullptr;
     if(!decodeCredentialPublicKey(credentialPublicKey, &decodedCredentialPublicKey))
