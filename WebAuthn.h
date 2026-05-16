@@ -161,50 +161,6 @@ const std::vector<PubKeyAlg> defaultSupportedPubKeyAlgos = {
     PubKeyAlg::RSASSA_PKCS1_v1_5_SHA_256
 };
 
-
-std::string encodeBase64Url(const char* data, size_t len)
-{
-    std::string str;
-    {
-        str.resize(len * 2);
-        size_t size = str.size();
-        base64_encode(data, len, str.data(), &size, 0);
-        str.resize(size);
-        str = urlSafeBase64(str);
-    }
-
-    return str;
-}
-
-std::string encodeBase64Url(const std::string& str)
-{
-    return encodeBase64Url(str.data(), str.size());
-}
-
-std::string decodeBase64Url(const char* data, uint32_t len)
-{
-    std::string normalisedStr;
-    normalisedStr.resize(len);
-    std::copy(data, data + len, normalisedStr.data());
-    normalisedStr = normalizeBase64(normalisedStr);
-    
-    std::string str;
-    {
-        str.resize(len);
-        size_t size = str.size();
-        int res = base64_decode(normalisedStr.data(), normalisedStr.size(), str.data(), &size, 0);
-        assert(res == 1);
-        str.resize(size);
-    }
-
-    return str;
-}
-
-std::string decodeBase64Url(const std::string& str)
-{
-    return decodeBase64Url(str.data(), str.size());
-}
-
 namespace internal
 {
 
